@@ -552,6 +552,13 @@ jobs:
               'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'VIBRATE', 'POST_NOTIFICATIONS'])
           s = s.replace('<application', perms + '<application', 1)
           open(p, 'w').write(s)
+          import glob
+          for g in glob.glob('app/android/app/build.gradle*'):
+              t = open(g).read()
+              t = re.sub(r'compileSdk(Version)?[ =]+[^\n]+', 'compileSdk = 36', t)
+              open(g, 'w').write(t)
+          with open('app/android/gradle.properties', 'a') as f:
+              f.write('\nandroid.suppressUnsupportedCompileSdk=36\n')
           PY_EOF
       - name: Compiler
         working-directory: app
