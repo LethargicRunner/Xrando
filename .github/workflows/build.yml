@@ -1,0 +1,565 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Creer le projet
+        run: |
+          flutter create --org com.mat --project-name randoguide --platforms=android app
+          rm -rf app/test
+          cat > app/pubspec.yaml <<'PUBSPEC_EOF'
+          name: randoguide
+          description: Guidage de rando sur trace GPX
+          publish_to: 'none'
+          version: 0.1.0+1
+          environment:
+            sdk: '>=3.3.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+            flutter_map: ^7.0.2
+            latlong2: ^0.9.1
+            geolocator: ^13.0.2
+            file_picker: ^8.1.2
+            xml: ^6.5.0
+            vibration: ^2.0.1
+          flutter:
+            uses-material-design: true
+          PUBSPEC_EOF
+          cat > app/lib/main.dart <<'DART_EOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:math' as math;
+
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:flutter_map/flutter_map.dart';
+          import 'package:geolocator/geolocator.dart';
+          import 'package:latlong2/latlong.dart';
+          import 'package:vibration/vibration.dart';
+          import 'package:xml/xml.dart';
+
+          void main() => runApp(const RandoApp());
+
+          const double offTrackM = 30; // seuil d'alerte hors-sentier (mètres)
+
+          class RandoApp extends StatelessWidget {
+            const RandoApp({super.key});
+
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: 'RandoGuide',
+                  debugShowCheckedModeBanner: false,
+                  theme: ThemeData(colorSchemeSeed: Colors.green, useMaterial3: true),
+                  home: const HomePage(),
+                );
+          }
+
+          // ---------- Géométrie ----------
+
+          double _rad(double d) => d * math.pi / 180;
+
+          double haversine(LatLng a, LatLng b) {
+            const r = 6371000.0;
+            final dLat = _rad(b.latitude - a.latitude);
+            final dLon = _rad(b.longitude - a.longitude);
+            final s1 = math.sin(dLat / 2);
+            final s2 = math.sin(dLon / 2);
+            final h = s1 * s1 +
+                math.cos(_rad(a.latitude)) * math.cos(_rad(b.latitude)) * s2 * s2;
+            return 2 * r * math.asin(math.sqrt(h));
+          }
+
+          double bearing(LatLng a, LatLng b) {
+            final dLon = _rad(b.longitude - a.longitude);
+            final y = math.sin(dLon) * math.cos(_rad(b.latitude));
+            final x = math.cos(_rad(a.latitude)) * math.sin(_rad(b.latitude)) -
+                math.sin(_rad(a.latitude)) *
+                    math.cos(_rad(b.latitude)) *
+                    math.cos(dLon);
+            return (math.atan2(y, x) * 180 / math.pi + 360) % 360;
+          }
+
+          String cardinal(double deg) {
+            const n = ['nord', 'nord-est', 'est', 'sud-est', 'sud', 'sud-ouest', 'ouest', 'nord-ouest'];
+            return n[((deg + 22.5) % 360 ~/ 45)];
+          }
+
+          class Hit {
+            final int seg;
+            final double t;
+            final double dist;
+            final LatLng point;
+            Hit(this.seg, this.t, this.dist, this.point);
+          }
+
+          class Track {
+            final List<LatLng> pts;
+            final List<double> cum = [0];
+
+            Track(this.pts) {
+              double c = 0;
+              for (var i = 1; i < pts.length; i++) {
+                c += haversine(pts[i - 1], pts[i]);
+                cum.add(c);
+              }
+            }
+
+            double get total => cum.last;
+
+            Hit _project(LatLng p, int i) {
+              final a = pts[i];
+              final b = pts[i + 1];
+              final k = math.cos(_rad(p.latitude));
+              final ax = (a.longitude - p.longitude) * k;
+              final ay = a.latitude - p.latitude;
+              final bx = (b.longitude - p.longitude) * k;
+              final by = b.latitude - p.latitude;
+              final dx = bx - ax;
+              final dy = by - ay;
+              final len2 = dx * dx + dy * dy;
+              double t = len2 == 0 ? 0 : -(ax * dx + ay * dy) / len2;
+              t = t.clamp(0.0, 1.0).toDouble();
+              final q = LatLng(
+                a.latitude + (b.latitude - a.latitude) * t,
+                a.longitude + (b.longitude - a.longitude) * t,
+              );
+              return Hit(i, t, haversine(p, q), q);
+            }
+
+            /// Point le plus proche de la trace. Cherche d'abord près du dernier
+            /// segment connu (évite les sauts sur les boucles), sinon sur toute la trace.
+            Hit nearest(LatLng p, {int? near}) {
+              Hit? best;
+              void scan(int from, int to) {
+                for (var i = from; i < to; i++) {
+                  final h = _project(p, i);
+                  if (best == null || h.dist < best!.dist) best = h;
+                }
+              }
+
+              if (near != null) {
+                scan(math.max(0, near - 10), math.min(pts.length - 1, near + 80));
+                if (best != null && best!.dist <= offTrackM * 2) return best!;
+              }
+              scan(0, pts.length - 1);
+              return best!;
+            }
+
+            double along(Hit h) => cum[h.seg] + (cum[h.seg + 1] - cum[h.seg]) * h.t;
+          }
+
+          List<LatLng> parseGpx(String s) {
+            final doc = XmlDocument.parse(s);
+            var els = doc.findAllElements('trkpt');
+            if (els.isEmpty) els = doc.findAllElements('rtept');
+            final out = <LatLng>[];
+            for (final e in els) {
+              final la = double.tryParse(e.getAttribute('lat') ?? '');
+              final lo = double.tryParse(e.getAttribute('lon') ?? '');
+              if (la != null && lo != null) out.add(LatLng(la, lo));
+            }
+            return out;
+          }
+
+          String fmtDist(double m) =>
+              m >= 1000 ? '${(m / 1000).toStringAsFixed(1)} km' : '${m.round()} m';
+
+          String fmtDur(double sec) {
+            final m = (sec / 60).round();
+            final h = m ~/ 60;
+            final mm = m % 60;
+            return h > 0 ? '$h h ${mm.toString().padLeft(2, '0')}' : '$mm min';
+          }
+
+          // ---------- Écran principal ----------
+
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key});
+
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> {
+            final MapController _map = MapController();
+            Track? _track;
+            String _name = '';
+            StreamSubscription<Position>? _sub;
+            Position? _pos;
+            Hit? _hit;
+            bool _off = false;
+            int _offCount = 0;
+            bool _follow = true;
+            bool _running = false;
+            bool _firstFix = true;
+            double _pace = 4.0; // km/h
+            Timer? _alertTimer;
+
+            @override
+            void dispose() {
+              _sub?.cancel();
+              _alertTimer?.cancel();
+              super.dispose();
+            }
+
+            void _snack(String m) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context)
+                  .showSnackBar(SnackBar(content: Text(m)));
+            }
+
+            Future<void> _pick() async {
+              final r = await FilePicker.platform
+                  .pickFiles(type: FileType.any, withData: true);
+              if (r == null || r.files.isEmpty) return;
+              final f = r.files.first;
+              final bytes = f.bytes;
+              if (bytes == null) {
+                _snack('Impossible de lire le fichier');
+                return;
+              }
+              try {
+                final pts = parseGpx(utf8.decode(bytes, allowMalformed: true));
+                if (pts.length < 2) throw 'aucun point de trace trouvé';
+                setState(() {
+                  _track = Track(pts);
+                  _name = f.name;
+                  _hit = null;
+                  _off = false;
+                  _offCount = 0;
+                });
+                _syncAlert();
+                WidgetsBinding.instance.addPostFrameCallback((_) => _fit());
+              } catch (e) {
+                _snack('GPX invalide : $e');
+              }
+            }
+
+            void _fit() {
+              final t = _track;
+              if (t == null) return;
+              _map.fitCamera(CameraFit.bounds(
+                bounds: LatLngBounds.fromPoints(t.pts),
+                padding: const EdgeInsets.all(48),
+              ));
+            }
+
+            Future<void> _start() async {
+              if (_track == null) {
+                _snack('Charge d’abord un fichier GPX');
+                return;
+              }
+              var perm = await Geolocator.checkPermission();
+              if (perm == LocationPermission.denied) {
+                perm = await Geolocator.requestPermission();
+              }
+              if (perm == LocationPermission.denied ||
+                  perm == LocationPermission.deniedForever) {
+                _snack('Autorisation de localisation refusée');
+                return;
+              }
+              if (!await Geolocator.isLocationServiceEnabled()) {
+                _snack('Active le GPS du téléphone');
+                return;
+              }
+              final settings = AndroidSettings(
+                accuracy: LocationAccuracy.best,
+                distanceFilter: 3,
+                intervalDuration: const Duration(seconds: 2),
+                foregroundNotificationConfig: const ForegroundNotificationConfig(
+                  notificationTitle: 'RandoGuide',
+                  notificationText: 'Guidage en cours',
+                  enableWakeLock: true,
+                ),
+              );
+              _firstFix = true;
+              _follow = true;
+              _sub = Geolocator.getPositionStream(locationSettings: settings)
+                  .listen(_onPos, onError: (e) => _snack('GPS : $e'));
+              setState(() => _running = true);
+            }
+
+            void _stop() {
+              _sub?.cancel();
+              _sub = null;
+              setState(() {
+                _running = false;
+                _off = false;
+                _offCount = 0;
+              });
+              _syncAlert();
+            }
+
+            void _onPos(Position p) {
+              final t = _track;
+              if (t == null) return;
+              final ll = LatLng(p.latitude, p.longitude);
+              final h = t.nearest(ll, near: _hit?.seg);
+              final reliable = p.accuracy <= 50;
+              setState(() {
+                _pos = p;
+                _hit = h;
+                if (reliable) {
+                  _offCount = h.dist > offTrackM ? _offCount + 1 : 0;
+                  _off = _offCount >= 2;
+                }
+              });
+              _syncAlert();
+              if (_follow) {
+                _map.move(ll, _firstFix ? 16 : _map.camera.zoom);
+                _firstFix = false;
+              }
+            }
+
+            void _syncAlert() {
+              if (_off && _alertTimer == null) {
+                _buzz();
+                _alertTimer =
+                    Timer.periodic(const Duration(seconds: 4), (_) => _buzz());
+              } else if (!_off) {
+                _alertTimer?.cancel();
+                _alertTimer = null;
+              }
+            }
+
+            Future<void> _buzz() async {
+              if (await Vibration.hasVibrator() ?? false) {
+                Vibration.vibrate(pattern: [0, 400, 200, 400]);
+              } else {
+                HapticFeedback.heavyImpact();
+              }
+            }
+
+            // ---------- UI ----------
+
+            Widget _stats() {
+              final t = _track;
+              final h = _hit;
+              if (t == null) return const SizedBox.shrink();
+              final remaining = h == null ? t.total : t.total - t.along(h);
+              final sec = remaining / (_pace * 1000 / 3600);
+              final eta = TimeOfDay.fromDateTime(
+                      DateTime.now().add(Duration(seconds: sec.round())))
+                  .format(context);
+              Widget cell(String label, String value) => Expanded(
+                    child: Column(children: [
+                      Text(value,
+                          style: const TextStyle(
+                              fontSize: 18, fontWeight: FontWeight.bold)),
+                      Text(label, style: const TextStyle(fontSize: 12)),
+                    ]),
+                  );
+              return Card(
+                margin: EdgeInsets.zero,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+                  child: Row(children: [
+                    cell('restant', fmtDist(remaining)),
+                    cell('durée', fmtDur(sec)),
+                    cell('arrivée', eta),
+                  ]),
+                ),
+              );
+            }
+
+            Widget _offBanner() {
+              final h = _hit;
+              final p = _pos;
+              if (!_off || h == null || p == null) return const SizedBox.shrink();
+              final me = LatLng(p.latitude, p.longitude);
+              final b = bearing(me, h.point);
+              final moving = p.speed > 0.6 && p.heading >= 0;
+              final angle = _rad(b - (moving ? p.heading : 0));
+              return Card(
+                color: Colors.red.shade700,
+                margin: const EdgeInsets.only(top: 8),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Row(children: [
+                    Transform.rotate(
+                      angle: angle,
+                      child: const Icon(Icons.navigation, color: Colors.white, size: 44),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('HORS SENTIER',
+                              style: TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 16)),
+                          Text(
+                            'Trace à ${fmtDist(h.dist)} direction ${cardinal(b)}',
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ]),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final t = _track;
+              final p = _pos;
+              final h = _hit;
+              return Scaffold(
+                appBar: AppBar(
+                  title: Text(_name.isEmpty ? 'RandoGuide' : _name,
+                      overflow: TextOverflow.ellipsis),
+                  actions: [
+                    PopupMenuButton<double>(
+                      icon: const Icon(Icons.speed),
+                      tooltip: 'Vitesse de marche',
+                      onSelected: (v) => setState(() => _pace = v),
+                      itemBuilder: (_) => [2.5, 3.0, 4.0, 5.0]
+                          .map((v) => CheckedPopupMenuItem<double>(
+                                value: v,
+                                checked: v == _pace,
+                                child: Text('$v km/h'),
+                              ))
+                          .toList(),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.folder_open),
+                      tooltip: 'Ouvrir un GPX',
+                      onPressed: _pick,
+                    ),
+                  ],
+                ),
+                body: Stack(children: [
+                  FlutterMap(
+                    mapController: _map,
+                    options: MapOptions(
+                      initialCenter: const LatLng(46.6, 2.4),
+                      initialZoom: 5.5,
+                      onPositionChanged: (cam, byGesture) {
+                        if (byGesture && _follow) setState(() => _follow = false);
+                      },
+                    ),
+                    children: [
+                      TileLayer(
+                        urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                        userAgentPackageName: 'com.mat.randoguide',
+                      ),
+                      if (t != null)
+                        PolylineLayer(polylines: [
+                          Polyline(points: t.pts, strokeWidth: 5, color: Colors.blue),
+                          if (_off && h != null && p != null)
+                            Polyline(
+                              points: [LatLng(p.latitude, p.longitude), h.point],
+                              strokeWidth: 3,
+                              color: Colors.red,
+                            ),
+                        ]),
+                      if (t != null)
+                        MarkerLayer(markers: [
+                          Marker(
+                            point: t.pts.first,
+                            width: 30,
+                            height: 30,
+                            child: const Icon(Icons.flag, color: Colors.green),
+                          ),
+                          Marker(
+                            point: t.pts.last,
+                            width: 30,
+                            height: 30,
+                            child: const Icon(Icons.flag, color: Colors.black),
+                          ),
+                        ]),
+                      if (p != null)
+                        MarkerLayer(markers: [
+                          Marker(
+                            point: LatLng(p.latitude, p.longitude),
+                            width: 28,
+                            height: 28,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: _off ? Colors.red : Colors.green,
+                                shape: BoxShape.circle,
+                                border: Border.all(color: Colors.white, width: 3),
+                              ),
+                            ),
+                          ),
+                        ]),
+                    ],
+                  ),
+                  Positioned(
+                    left: 8,
+                    right: 8,
+                    top: 8,
+                    child: Column(children: [_stats(), _offBanner()]),
+                  ),
+                  if (p != null && !_follow)
+                    Positioned(
+                      right: 12,
+                      bottom: 96,
+                      child: FloatingActionButton.small(
+                        onPressed: () {
+                          setState(() => _follow = true);
+                          _map.move(LatLng(p.latitude, p.longitude), 16);
+                        },
+                        child: const Icon(Icons.my_location),
+                      ),
+                    ),
+                  if (t == null)
+                    const Center(
+                      child: Card(
+                        child: Padding(
+                          padding: EdgeInsets.all(16),
+                          child: Text('Ouvre un fichier GPX (icône dossier)\npour commencer.',
+                              textAlign: TextAlign.center),
+                        ),
+                      ),
+                    ),
+                ]),
+                floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+                floatingActionButton: FloatingActionButton.extended(
+                  onPressed: _running ? _stop : _start,
+                  backgroundColor: _running ? Colors.red.shade100 : null,
+                  icon: Icon(_running ? Icons.stop : Icons.play_arrow),
+                  label: Text(_running ? 'Arrêter' : 'Démarrer la rando'),
+                ),
+              );
+            }
+          }
+          DART_EOF
+          python3 - <<'PY_EOF'
+          import re
+          p = 'app/android/app/src/main/AndroidManifest.xml'
+          s = open(p).read()
+          perms = ''.join('<uses-permission android:name="android.permission.%s"/>\n' % x for x in [
+              'INTERNET', 'ACCESS_FINE_LOCATION', 'ACCESS_COARSE_LOCATION',
+              'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'VIBRATE', 'POST_NOTIFICATIONS'])
+          s = s.replace('<application', perms + '<application', 1)
+          open(p, 'w').write(s)
+          PY_EOF
+      - name: Compiler
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build apk --release
+      - name: Publier l'APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ github.run_number }}" app/build/app/outputs/flutter-apk/app-release.apk --title "RandoGuide ${{ github.run_number }}" --notes "APK de test"
