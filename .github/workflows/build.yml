@@ -552,35 +552,6 @@ jobs:
               'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'VIBRATE', 'POST_NOTIFICATIONS'])
           s = s.replace('<application', perms + '<application', 1)
           open(p, 'w').write(s)
-          import glob
-          for g in glob.glob('app/android/app/build.gradle*'):
-              t = open(g).read()
-              t = re.sub(r'compileSdk(Version)?[ =]+[^\n]+', 'compileSdk = 36', t)
-              open(g, 'w').write(t)
-          with open('app/android/gradle.properties', 'a') as f:
-              f.write('\nandroid.suppressUnsupportedCompileSdk=36\n')
-          import os
-          kts = 'app/android/build.gradle.kts'
-          kotlin_snip = """
-          subprojects {
-              tasks.configureEach {
-                  if (name.startsWith("check") && name.endsWith("AarMetadata")) {
-            enabled = false
-                  }
-              }
-          }
-          """
-          groovy_snip = """
-          subprojects {
-              tasks.configureEach { t ->
-                  if (t.name.startsWith('check') && t.name.endsWith('AarMetadata')) { t.enabled = false }
-              }
-          }
-          """
-          if os.path.exists(kts):
-              open(kts, 'a').write(kotlin_snip)
-          else:
-              open('app/android/build.gradle', 'a').write(groovy_snip)
           PY_EOF
       - name: Compiler
         working-directory: app
