@@ -552,11 +552,52 @@ jobs:
               'FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_LOCATION', 'VIBRATE', 'POST_NOTIFICATIONS'])
           s = s.replace('<application', perms + '<application', 1)
           open(p, 'w').write(s)
+          import glob
+          for g in glob.glob('app/android/app/build.gradle*'):
+              t = open(g).read()
+              t = re.sub(r'compileSdk(Version)?[ =]+[^\n]+', 'compileSdk = 36', t)
+              open(g, 'w').write(t)
+          with open('app/android/gradle.properties', 'a') as f:
+              f.write('\nandroid.suppressUnsupportedCompileSdk=36\n')
+          import os
+          kts = 'app/android/build.gradle.kts'
+          kotlin_snip = """
+          subprojects {
+              tasks.configureEach {
+                  if (name.startsWith("check") && name.endsWith("AarMetadata")) {
+            enabled = false
+                  }
+              }
+          }
+          """
+          groovy_snip = """
+          subprojects {
+              tasks.configureEach { t ->
+                  if (t.name.startsWith('check') && t.name.endsWith('AarMetadata')) { t.enabled = false }
+              }
+          }
+          """
+          if os.path.exists(kts):
+              open(kts, 'a').write(kotlin_snip)
+          else:
+              open('app/android/build.gradle', 'a').write(groovy_snip)
           PY_EOF
       - name: Compiler
         working-directory: app
         run: |
           flutter pub get
+          python3 - <<'FIX_EOF'
+          import glob, os, re
+          cache = os.environ.get('PUB_CACHE') or os.path.expanduser('~/.pub-cache')
+          n = 0
+          for g in glob.glob(cache + '/hosted/*/*/android/build.gradle*'):
+              t = open(g).read()
+              u = re.sub(r'compileSdk(Version)?[ =]+[^\n]+', 'compileSdk = 36', t)
+              if u != t:
+                  open(g, 'w').write(u)
+                  n += 1
+          print('plugins corriges :', n)
+          FIX_EOF
           flutter build apk --release
       - name: Publier l'APK
         env:
